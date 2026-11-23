@@ -277,60 +277,69 @@ All data lives in one schema, so dropping the schema removes it all.
 
 ## Deploy and run
 
-**Prerequisites:** a Unity Catalog workspace with serverless jobs and notebooks enabled; permission to create a schema in your
-catalog, classic clusters for pipelines, and jobs; MLflow 3 deployment jobs available (Public Preview); PyPI access from
-serverless (the notebooks install `mlflow>=3`); the Databricks CLI (tested with v1.21.0) for a laptop deploy.
+Everything below happens in the Databricks workspace UI, using the bundle editor of a Git folder.
 
-**Configure** the defaults in `databricks.yml` (not with `--var`: the scripts redeploy without it):
+**Prerequisites:** a Unity Catalog workspace with workspace files and serverless compute enabled; permission to create a schema
+in your catalog, classic clusters for pipelines, and jobs; MLflow 3 deployment jobs available (Public Preview); PyPI access from
+serverless (the notebooks install `mlflow>=3`).
 
-```yaml
-variables:
-  catalog:   { default: <your catalog> }
-  schema:    { default: <a new schema> }
-  node_type: { default: r5d.xlarge }     # 4 vCPU / 32 GB; change it if not available
-targets:
-  dev:
-    workspace:
-      host: <your workspace URL>        # no profile here: pass --profile on the command line
-```
+1. **Clone the repository as a Git folder.** In the workspace browser, click **Create → Git folder** and paste
+   `https://github.com/francisco-martin-databricks/orderbook_ml_starter.git`.
+2. **Point it at your workspace and data.** Open `databricks.yml` in the Git folder and set these defaults. The bundle editor
+   deploys to the workspace you are in, so `host` is this workspace's URL.
 
-`databricks.yml` has no profile on purpose, because the workspace authenticates the CLI from its environment and doesn't
-support profiles. Locally, pass `--profile` to every command and export `PROFILE=<profile>` for the scripts.
-
-**Deploy** from a laptop with `databricks bundle deploy --profile <profile>`, or from the workspace: clone this repository as a
-Git folder, open it, and in the bundle editor's **Deployments** panel pick `dev` and click **Deploy**. Both are the same
-deployment (same bundle name, target and user), so they update the same jobs and pipeline.
-
-**Run:**
-
-```bash
-databricks bundle deploy --profile <profile>   # the first deploy creates everything and starts the pipeline
-scripts/live.sh start                          # unpause the feed (and start the pipeline if it isn't running)
-# when bronze has the three days, train them one at a time, oldest first:
-databricks bundle run train_model --params train_date=<YYYY-MM-DD> --profile <profile>
-# once the deployment job has promoted v2, score day 3:
-databricks bundle run score_predictions --params score_date=<YYYY-MM-DD> --profile <profile>
-scripts/live.sh stop                           # pause the feed and stop the pipeline
-```
-
-Train and score only complete days (UTC). Without parameters, both jobs use yesterday.
+   ```yaml
+   variables:
+     catalog:   { default: <your catalog> }   # an existing catalog where you can create a schema
+     schema:    { default: <a new schema> }   # created by the bundle, used only by this project
+     node_type: { default: r5d.xlarge }       # 4 vCPU / 32 GB; change it if not available
+   targets:
+     dev:
+       workspace:
+         host: <this workspace's URL>
+   ```
+3. **Deploy.** With `databricks.yml` open, click the deployments icon. In the **Deployments** pane choose the `dev` target,
+   click **Deploy**, review the **Deploy to dev** dialog and click **Deploy**. The status appears in **Project output**, and
+   the deployed resources are listed in **Bundle resources**. The first deploy creates the schema, the landing volume, the
+   experiment, the pipeline and the four jobs, and **starts the pipeline**; its classic cluster takes 7 to 8 minutes to come up.
+4. **Start the feed.** In **Bundle resources**, open `[orderbook-ml-starter] exchange_feed` and click **Resume** (it is a
+   continuous job, paused by default). On its first start it writes the last three days at once, then one file a minute.
+5. **Wait for bronze.** Open `orderbook_bronze` in Catalog Explorer: once the pipeline is running it holds the three days
+   (4,320 rows a day) and the latest minute, usually within a couple of minutes.
+6. **Train the three days, oldest first, one run at a time.** Open `train_model`, click the caret next to **Run now**, choose
+   **Run now with different settings**, set `train_date` to the first day (`YYYY-MM-DD`) and click **Run**. Repeat for the
+   second day once the first run has finished. For the third day, which is yesterday when you started the feed today, the play
+   icon in **Bundle resources** is enough, because `train_date` defaults to yesterday. Each new version starts
+   `model_deployment` by itself: v1 and v2 are promoted, and v3 waits for approval because the spread's coefficient changed
+   sign.
+7. **Score the third day.** When the model `next_5min_return_lr` shows `@champion` on v2, run `score_predictions` with its
+   play icon (it scores yesterday by default) or with a `score_date`.
+8. **Stop when you are done.** Open `exchange_feed` and click **Pause** (cancel its run if one is still active), then open the
+   pipeline and click **Stop**.
 
 **Cost guard.** The feed and the pipeline run until they are stopped, and the pipeline is classic on-demand compute. Creating
-the pipeline or changing its settings starts it; a redeploy that only changes SQL doesn't. **A deploy sets the feed job back to
-paused, but a feed run already in progress keeps writing**, and `live.sh status` then reports `PAUSED`. Run
-`scripts/live.sh stop` after every session (it also cancels the feed run) and check with `scripts/live.sh status`.
+the pipeline or changing its settings starts it; a deploy that only changes SQL doesn't. **Every deploy sets the feed job back to
+paused, but a feed run already in progress keeps writing**, so check the job's active runs, not only its paused state. Avoid
+deploying while a session is live.
+
+**Prefer the command line?** The same bundle deploys from a laptop or from the workspace web terminal with
+`databricks bundle deploy --profile <profile>` (`databricks.yml` holds no profile on purpose, because the workspace
+authenticates the CLI from its environment). `scripts/live.sh start|stop|status` and `scripts/reset_demo.sh` automate steps
+4 to 8. [`AGENT.md`](AGENT.md) has the full command-line path.
 
 ## Operate
 
-- **Approve a waiting version:** open the version in Catalog Explorer and click **Approve**, or set the `Approval_Check` tag and
-  repair the run with its `job_parameters` (and `latest_repair_id` if it was repaired before). A repair without parameters
-  fails on purpose instead of promoting the wrong version.
-- **Switch approval mode:** change `approval_mode` in the job's parameters in the Jobs UI, or deploy with
-  `--var approval_mode=human`. While the feed is live, use the Jobs UI (a deploy re-pauses the feed job).
-- **Reset to a known state:** `scripts/reset_demo.sh` (about 8 minutes) redeploys, deletes the model and the experiment's runs,
-  empties `predictions`, trains the first three days again and scores the third. You end with `@champion` = v2 and v3 waiting
-  for approval. Bronze and the landing files are kept. If it stops on an error, wait until `model_deployment` has no active run
-  and run it again.
+- **Approve a waiting version:** open the model version in Catalog Explorer and click **Approve**. The waiting deployment run
+  continues and moves `@champion`.
+- **Switch approval mode:** open `model_deployment` in the Jobs UI and change the `approval_mode` parameter (`auto` or
+  `human`). The next version follows the new mode.
+- **Update the project:** after pulling new commits into the Git folder, deploy again from the bundle editor. A deploy from the
+  editor and one from the command line are the same deployment (same bundle name, target and user), so they update the same
+  jobs and pipeline.
+- **Reset to a known state:** `scripts/reset_demo.sh` (about 8 minutes, from the web terminal or a laptop) redeploys, deletes
+  the model and the experiment's runs, empties `predictions`, trains the first three days again and scores the third. You end
+  with `@champion` = v2 and v3 waiting for approval. Bronze and the landing files are kept. If it stops on an error, wait until
+  `model_deployment` has no active run and run it again.
 - **Change the file format or the bronze columns:** the feed fails on files in another format, and new columns need one full
   refresh:
 
@@ -342,9 +351,6 @@ paused, but a feed run already in progress keeps writing**, and `live.sh status`
   scripts/live.sh start
   scripts/reset_demo.sh   # once bronze has caught up
   ```
-- **Work from the workspace:** after a push, pull in the Git folder before deploying from it. The scripts also run in the
-  web terminal (classic compute on Databricks Runtime 15.0 or above, enabled by an admin): `cd` into the Git folder and run
-  `bash scripts/live.sh status`.
 - **Use your own variables:** change the view (and, on synthetic data, the feed's planted effects). Training, deployment and
   scoring pick up the view's columns without changes.
 
@@ -411,4 +417,6 @@ orderbook-ml-starter/
   [Data quality monitoring (data profiling)](https://docs.databricks.com/aws/en/data-quality-monitoring/)
 - Deployment: [Declarative Automation Bundles](https://docs.databricks.com/aws/en/dev-tools/bundles/) ·
   [Bundles in the workspace](https://docs.databricks.com/aws/en/dev-tools/bundles/workspace) ·
+  [Deploy bundles and run workflows from the workspace](https://docs.databricks.com/aws/en/dev-tools/bundles/workspace-deploy) ·
+  [Run a job with different settings](https://docs.databricks.com/aws/en/jobs/run-now#run-a-job-with-different-settings) ·
   [Web terminal](https://docs.databricks.com/aws/en/compute/web-terminal)
