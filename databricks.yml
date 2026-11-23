@@ -1,0 +1,39 @@
+# Order book ML starter: an exchange feed, a continuous bronze pipeline, a daily training job and an
+# MLflow 3 deployment job. See README.md.
+bundle:
+  name: orderbook-ml-starter
+
+# This folder sits inside a repo whose .gitignore excludes it, so list what the bundle must sync.
+sync:
+  include:
+    - src/**
+    - resources/**
+    - databricks.yml
+    - README.md
+
+include:
+  - resources/*.yml
+
+variables:
+  catalog:
+    description: Catalog for the schema, the landing volume, the tables and the model
+    default: francisco_martin_catalog
+  schema:
+    description: Schema created by this bundle
+    default: orderbook_ml_starter
+  node_type:
+    description: The single node of the continuous pipeline (4 vCPU / 32 GB is the documented driver minimum)
+    default: r5d.xlarge
+  approval_mode:
+    description: "auto = a version that passes the evaluation rule is promoted with no human; human = every version waits for Approve"
+    default: auto
+
+targets:
+  # No "mode: development" on purpose: development mode always deploys pipelines as triggered, not continuous.
+  dev:
+    default: true
+    workspace:
+      # No profile here: pass --profile locally. The workspace web terminal authenticates from its environment and
+      # doesn't support profiles, so a profile in this file would break deploying from the workspace.
+      host: https://fevm-francisco-martin-classic.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/orderbook-ml-starter

@@ -1,0 +1,17 @@
+# 0 · The exchange feed. A continuous job: while it is unpaused, a new file lands every minute.
+resources:
+  jobs:
+    exchange_feed:
+      name: "[${bundle.name}] exchange_feed"
+      continuous:
+        pause_status: PAUSED  # unpause to start the feed, pause to stop it (scripts/live.sh does both)
+      tasks:
+        - task_key: feed
+          notebook_task:
+            notebook_path: ../src/feed/exchange_feed.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.starter.name}
+              landing_volume: ${resources.volumes.landing.name}
+              exchange: exchange_1
+              backfill_days: "3"

@@ -1,0 +1,30 @@
+# 2 · Training: setup (view, model, link to the deployment job), then one day of training.
+resources:
+  jobs:
+    train_model:
+      name: "[${bundle.name}] train_model"
+      max_concurrent_runs: 1
+      parameters:
+        - name: train_date      # YYYY-MM-DD; empty = yesterday (UTC)
+          default: ""
+      schedule:
+        quartz_cron_expression: "0 30 0 * * ?"  # 00:30 UTC, after the day is complete
+        timezone_id: UTC
+        pause_status: PAUSED    # synthetic data: run it by hand
+      tasks:
+        - task_key: setup
+          notebook_task:
+            notebook_path: ../src/training/setup.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.starter.name}
+              deployment_job_id: ${resources.jobs.model_deployment.id}
+        - task_key: train
+          depends_on:
+            - task_key: setup
+          notebook_task:
+            notebook_path: ../src/training/train.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.starter.name}
+              experiment_id: ${resources.experiments.training.id}

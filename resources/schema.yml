@@ -1,0 +1,17 @@
+# Where everything lives: the schema, the volume that stands in for the S3 bucket the exchanges write to,
+# and the MLflow experiment the training runs log to.
+resources:
+  schemas:
+    starter:
+      catalog_name: ${var.catalog}
+      name: ${var.schema}
+      comment: Order book ML starter (synthetic data)
+  volumes:
+    landing:
+      catalog_name: ${var.catalog}
+      schema_name: ${resources.schemas.starter.name}
+      name: landing
+      volume_type: MANAGED
+  experiments:
+    training:
+      name: /Workspace/Users/${workspace.current_user.userName}/orderbook-ml-starter/experiment

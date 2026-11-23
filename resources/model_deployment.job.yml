@@ -1,0 +1,32 @@
+# 3 · The MLflow 3 deployment job. setup.py links it to the model, so every new version starts it.
+resources:
+  jobs:
+    model_deployment:
+      name: "[${bundle.name}] model_deployment"
+      max_concurrent_runs: 1    # with the queue, versions are checked one at a time, in order
+      queue:
+        enabled: true
+      parameters:
+        - name: model_name
+          default: ${var.catalog}.${var.schema}.next_5min_return_lr
+        - name: model_version   # set by each new version; empty on purpose, so a run without it fails instead of using a wrong version
+          default: ""
+        - name: approval_mode   # auto | human
+          default: ${var.approval_mode}
+      tasks:
+        - task_key: Evaluation
+          max_retries: 0
+          notebook_task:
+            notebook_path: ../src/deployment/evaluation.py
+        - task_key: Approval_Check
+          max_retries: 0
+          depends_on:
+            - task_key: Evaluation
+          notebook_task:
+            notebook_path: ../src/deployment/approval_check.py
+        - task_key: Deployment
+          max_retries: 0
+          depends_on:
+            - task_key: Approval_Check
+          notebook_task:
+            notebook_path: ../src/deployment/deployment.py

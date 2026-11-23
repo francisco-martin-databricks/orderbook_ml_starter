@@ -1,0 +1,6 @@
+# Local bundle state and CLI caches
+.databricks/
+# Design notes are kept local
+2026-11-10_SPEC.md
+.DS_Store
+__pycache__/

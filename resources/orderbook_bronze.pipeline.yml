@@ -1,0 +1,27 @@
+# 1 · The bronze pipeline: continuous, classic compute, single node. Each file is appended as it lands.
+# Deploying it (creating it or changing its settings) starts it. Stop it with scripts/live.sh stop.
+resources:
+  pipelines:
+    orderbook_bronze:
+      name: "[${bundle.name}] orderbook_bronze"
+      catalog: ${var.catalog}
+      schema: ${resources.schemas.starter.name}
+      serverless: false         # classic compute
+      continuous: true          # always on: picks up each file as it lands
+      edition: CORE             # streaming ingest only, all a bronze table needs
+      photon: false
+      channel: CURRENT
+      root_path: ../src/orderbook_bronze
+      configuration:
+        landing_path: /Volumes/${var.catalog}/${resources.schemas.starter.name}/${resources.volumes.landing.name}/
+      libraries:
+        - glob:
+            include: ../src/orderbook_bronze/transformations/**
+      clusters:
+        - label: default
+          num_workers: 0               # single node: the driver does the work
+          node_type_id: ${var.node_type}
+          aws_attributes:
+            availability: ON_DEMAND    # an always-on driver shouldn't run on spot
+          custom_tags:
+            demo_name: orderbook-ml-starter

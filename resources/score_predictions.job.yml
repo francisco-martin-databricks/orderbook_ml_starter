@@ -1,0 +1,20 @@
+# 4 · Scoring: every day, the current @champion scores the day's minutes into the predictions table.
+resources:
+  jobs:
+    score_predictions:
+      name: "[${bundle.name}] score_predictions"
+      max_concurrent_runs: 1
+      parameters:
+        - name: score_date      # YYYY-MM-DD; empty = yesterday (UTC)
+          default: ""
+      schedule:
+        quartz_cron_expression: "0 0 1 * * ?"   # 01:00 UTC, after training
+        timezone_id: UTC
+        pause_status: PAUSED    # synthetic data: run it by hand
+      tasks:
+        - task_key: score
+          notebook_task:
+            notebook_path: ../src/scoring/score.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${resources.schemas.starter.name}
