@@ -1,0 +1,47 @@
+flowchart TB
+  subgraph S1["Ingest: continuous"]
+    direction LR
+    FEED["<b>0 · exchange_feed</b> job<br/>a synthetic exchange:<br/>one JSON file a minute,<br/>20 book levels a side"]
+    LAND[("<b>landing</b> volume<br/>stands in for S3<br/>exchange/date/HHMM.json")]
+    PIPE["<b>1 · orderbook_bronze</b><br/>pipeline: Auto Loader<br/>in continuous mode,<br/>one classic node"]
+    BRONZE[("<b>orderbook_bronze</b> table<br/>top 5 levels as arrays,<br/>full record as VARIANT")]
+    FEED -->|"writes a file<br/>every minute"| LAND -->|"picks up<br/>each new file"| PIPE -->|"appends<br/>in seconds"| BRONZE
+  end
+
+  subgraph S2["Train and promote: daily, and on every new version"]
+    direction LR
+    VIEW["<b>minute_features</b> view<br/>2 drivers + the label,<br/>computed when read"]
+    TRAIN["<b>2 · train_model</b> job<br/>linear regression on<br/>one day; logs every<br/>coefficient"]
+    EXP[("MLflow experiment<br/>one run per day:<br/>coefficients, holdout error")]
+    MODEL[("<b>next_5min_return_lr</b><br/>Unity Catalog model:<br/>versions + @champion")]
+    DEPLOY["<b>3 · model_deployment</b> job<br/>Evaluation →<br/>Approval_Check →<br/>Deployment<br/>(auto or human approval)"]
+    VIEW -->|"one day<br/>of features"| TRAIN
+    TRAIN -->|"logs the run"| EXP
+    TRAIN -->|"registers<br/>a version"| MODEL
+    MODEL -->|"every new version<br/>starts the job"| DEPLOY
+    DEPLOY -.->|"moves @champion<br/>when approved"| MODEL
+  end
+
+  subgraph S3["Score and watch: daily"]
+    direction LR
+    SCORE["<b>4 · score_predictions</b> job<br/>@champion scores<br/>the day's minutes"]
+    PRED[("<b>predictions</b> table<br/>prediction, actual and<br/>model version on every row")]
+    MON["Data profiling monitor<br/>drift and error<br/>by model version"]
+    UI["Your UI or reports<br/>read the table"]
+    SCORE -->|"writes"| PRED
+    PRED -->|"profiled"| MON
+    PRED -->|"read"| UI
+  end
+
+  S1 ==>|"bronze is read on demand"| S2
+  S2 ==>|"@champion + features"| S3
+
+  classDef compute fill:#FFF1EB,stroke:#FF5F32,stroke-width:1.5px,color:#1B3139
+  classDef storage fill:#EAF3FB,stroke:#2272B4,stroke-width:1.5px,color:#1B3139
+  classDef outside fill:#F4F4F4,stroke:#8A8A8A,stroke-dasharray:4 3,color:#1B3139
+  class FEED,PIPE,VIEW,TRAIN,DEPLOY,SCORE,MON compute
+  class LAND,BRONZE,EXP,MODEL,PRED storage
+  class UI outside
+  style S1 fill:#F7F9FA,stroke:#BFC7CC,color:#1B3139
+  style S2 fill:#F7F9FA,stroke:#BFC7CC,color:#1B3139
+  style S3 fill:#F7F9FA,stroke:#BFC7CC,color:#1B3139

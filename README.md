@@ -1,182 +1,414 @@
 # orderbook-ml-starter
 
-**Date:** 2026-11-10, updated 2026-11-22 (20-level book, VARIANT bronze, scoring and drift monitor)
+**Last updated:** 2026-11-23
 
-A small Databricks project that shows five components end to end on synthetic data:
-**an exchange feed lands one file per minute → Auto Loader in a continuous pipeline appends it to bronze → a daily job trains a
-linear regression and logs every coefficient → an MLflow 3 deployment job decides whether the new version becomes `@champion`
-→ a daily job scores the day with `@champion` into a predictions table watched by a drift monitor.**
+A small, working Databricks project that runs the whole loop on synthetic order book data. Snapshots land as files every
+minute, a continuous pipeline appends them to a bronze table, a daily job retrains a model and records every coefficient, a
+deployment job decides whether the new version goes live, and the live version scores each day into a table that is monitored
+for drift. Every piece is kept to its simplest working form so the project can be read in one sitting and copied; it is a base
+to build on, not a production system. It deploys as one Declarative Automation Bundle (formerly Databricks Asset Bundle).
 
-It is a base to read and build on, not a complete or production-grade system. Every piece is kept to its simplest working form.
-Deploying it with a coding tool: [`AGENT.md`](AGENT.md). The design notes (`2026-11-10_SPEC.md`) are kept outside the repository.
+Using a coding tool to deploy it? Point it at [`AGENT.md`](AGENT.md) first.
 
-## What's in it
+## Architecture
 
-| # | Piece | What it does |
-|---|-------|--------------|
-| 0 | `src/feed/exchange_feed.py` · job `exchange_feed` | Pretends to be one exchange: writes one JSON file per minute into the `landing` volume, which stands in for S3. One line per corridor (3 corridors) with the order book, 20 levels a side. A continuous job, paused by default. On the first start it writes the last 3 days at once, then goes live. |
-| 1 | `src/orderbook_bronze/transformations/orderbook_bronze.sql` · pipeline `orderbook_bronze` | The whole pipeline: Auto Loader (`read_files`) appends every file to one bronze table, with the top 5 levels a side parsed as arrays (`bids`, `asks`) and the full line kept as `raw` (VARIANT). Continuous, classic compute, single node, Core edition. |
-| 1 | `src/training/minute_features.sql` | A view on bronze: two drivers (`spread_bps` from the best bid and ask, `order_imbalance` over the top 5 levels) and the label (`next_5min_return_bps`), computed when it's read. |
-| 2 | `src/training/setup.py`, `train.py` · job `train_model` | Setup creates the view and the UC model and links the deployment job. Train fits a `LinearRegression` on one day, logs every coefficient and the holdout error, and registers a version. |
-| 3 | `src/deployment/evaluation.py`, `approval_check.py`, `deployment.py` · job `model_deployment` | Runs for every new version: compares it with `@champion`, approves it (automatically or by a person), and moves `@champion`. |
-| 4 | `src/scoring/score.py` · job `score_predictions` | Scores one day with `@champion` into the `predictions` table (prediction, actual and model version on every row). The first run creates a data profiling monitor on the table. Daily schedule, paused. |
+```mermaid
+flowchart TB
+  subgraph S1["Ingest: continuous"]
+    direction LR
+    FEED["<b>0 · exchange_feed</b> job<br/>a synthetic exchange:<br/>one JSON file a minute,<br/>20 book levels a side"]
+    LAND[("<b>landing</b> volume<br/>stands in for S3<br/>exchange/date/HHMM.json")]
+    PIPE["<b>1 · orderbook_bronze</b><br/>pipeline: Auto Loader<br/>in continuous mode,<br/>one classic node"]
+    BRONZE[("<b>orderbook_bronze</b> table<br/>top 5 levels as arrays,<br/>full record as VARIANT")]
+    FEED -->|"writes a file<br/>every minute"| LAND -->|"picks up<br/>each new file"| PIPE -->|"appends<br/>in seconds"| BRONZE
+  end
 
-Configuration lives in `databricks.yml` (variables) and `resources/` (one file per component, plus `schema.yml` for the
-schema, the landing volume and the MLflow experiment).
+  subgraph S2["Train and promote: daily, and on every new version"]
+    direction LR
+    VIEW["<b>minute_features</b> view<br/>2 drivers + the label,<br/>computed when read"]
+    TRAIN["<b>2 · train_model</b> job<br/>linear regression on<br/>one day; logs every<br/>coefficient"]
+    EXP[("MLflow experiment<br/>one run per day:<br/>coefficients, holdout error")]
+    MODEL[("<b>next_5min_return_lr</b><br/>Unity Catalog model:<br/>versions + @champion")]
+    DEPLOY["<b>3 · model_deployment</b> job<br/>Evaluation →<br/>Approval_Check →<br/>Deployment<br/>(auto or human approval)"]
+    VIEW -->|"one day<br/>of features"| TRAIN
+    TRAIN -->|"logs the run"| EXP
+    TRAIN -->|"registers<br/>a version"| MODEL
+    MODEL -->|"every new version<br/>starts the job"| DEPLOY
+    DEPLOY -.->|"moves @champion<br/>when approved"| MODEL
+  end
 
-## The model
+  subgraph S3["Score and watch: daily"]
+    direction LR
+    SCORE["<b>4 · score_predictions</b> job<br/>@champion scores<br/>the day's minutes"]
+    PRED[("<b>predictions</b> table<br/>prediction, actual and<br/>model version on every row")]
+    MON["Data profiling monitor<br/>drift and error<br/>by model version"]
+    UI["Your UI or reports<br/>read the table"]
+    SCORE -->|"writes"| PRED
+    PRED -->|"profiled"| MON
+    PRED -->|"read"| UI
+  end
 
-`next_5min_return_bps = intercept + b1 · spread_bps + b2 · order_imbalance`, trained on the first 18 hours of a day and measured
-on the last 6. The feed plants the truth: `b1 = +0.40` and `b2 = 0.80` on days 1 and 2, then from day 3 the spread's effect
-**flips to −0.40**. The features are every column of the view except the keys and the label, so to try other variables,
-change the view (and the feed); `train.py`, the deployment job and the scoring job don't change.
+  S1 ==>|"bronze is read on demand"| S2
+  S2 ==>|"@champion + features"| S3
 
-## Automatic or human approval: one setting
+  classDef compute fill:#FFF1EB,stroke:#FF5F32,stroke-width:1.5px,color:#1B3139
+  classDef storage fill:#EAF3FB,stroke:#2272B4,stroke-width:1.5px,color:#1B3139
+  classDef outside fill:#F4F4F4,stroke:#8A8A8A,stroke-dasharray:4 3,color:#1B3139
+  class FEED,PIPE,VIEW,TRAIN,DEPLOY,SCORE,MON compute
+  class LAND,BRONZE,EXP,MODEL,PRED storage
+  class UI outside
+  style S1 fill:#F7F9FA,stroke:#BFC7CC,color:#1B3139
+  style S2 fill:#F7F9FA,stroke:#BFC7CC,color:#1B3139
+  style S3 fill:#F7F9FA,stroke:#BFC7CC,color:#1B3139
+```
 
-The deployment job has a parameter `approval_mode` (default from the bundle variable of the same name).
-Evaluation always applies one rule: **the MAE on the candidate's holdout is at most 5% worse than the champion's, and no
-coefficient changed sign.** It writes the result on the version as the `evaluation` tag.
+If the diagram doesn't render where you are reading this, open [`docs/architecture.png`](docs/architecture.png).
+
+Orange boxes run code (the jobs, the pipeline and the monitor) and blue cylinders hold data (a volume, tables, the MLflow
+experiment and the Unity Catalog model). Only the first row runs all the time; everything else runs once a day, or when a new
+model version appears.
+
+## Components at a glance
+
+| # | Component | What it does | Runs on | When | Files |
+|---|-----------|--------------|---------|------|-------|
+| 0 | `exchange_feed` job | Pretends to be one exchange: writes one JSON file a minute with the order book of 3 corridors | Serverless | Continuous while unpaused (paused by default) | `src/feed/exchange_feed.py` |
+| 1 | `orderbook_bronze` pipeline | Auto Loader appends every new file to the bronze table | Classic, one node | Continuous | `src/orderbook_bronze/transformations/orderbook_bronze.sql` |
+| 1 | `minute_features` view | Turns each snapshot into the model's two inputs and the value to predict | Nothing runs | Computed when read | `src/training/minute_features.sql` |
+| 2 | `train_model` job | Creates the view and the model if needed, trains on one day, logs every coefficient, registers a version | Serverless | Daily at 00:30 UTC (schedule paused) | `src/training/setup.py`, `src/training/train.py` |
+| 3 | `model_deployment` job | Compares each new version with `@champion`, waits for approval when needed, moves `@champion` | Serverless | On every new model version | `src/deployment/*.py` |
+| 4 | `score_predictions` job | `@champion` scores one day into `predictions`; creates the data profiling monitor | Serverless | Daily at 01:00 UTC (schedule paused) | `src/scoring/score.py` |
+
+Each component's job or pipeline definition is in `resources/` (one YAML file per component, plus `schema.yml` for the
+schema, the landing volume and the experiment). The schedules ship paused because the data is synthetic: you run the jobs by
+hand (see [Deploy and run](#deploy-and-run)).
+
+## How each piece works
+
+### 0 · Exchange feed (synthetic)
+
+- It stands in for the producers that write to S3 (for example AWS Lambda functions). Every minute it writes
+  `landing/exchange_1/<YYYY-MM-DD>/<HHMM>.json`, one JSON line per corridor (`USD-MXN`, `USD-BRL`, `USD-PHP`, illustrative)
+  with `exchange`, `ticker`, `ts`, and `bids` and `asks` as 20 `[price, size]` pairs a side.
+- On its first start the folder is empty, so it writes three days at once from midnight UTC, then one file a minute. After a
+  pause it carries on from the last file, so no minute is ever missing and prices continue where they stopped.
+- The data has known effects planted in it: each minute, the spread and the order imbalance move the price over the
+  following minutes by fixed amounts, plus random noise. **From the third day the spread's effect flips sign**, which gives
+  the training and deployment steps a market change to detect. Because the true values are known, you can check that the
+  model finds them (section 2).
+- It is a continuous job: unpausing starts it and pausing (plus cancelling the run) stops it. `scripts/live.sh` does both.
+
+### 1 · Bronze pipeline
+
+The whole pipeline is one SQL statement:
+
+```sql
+CREATE OR REFRESH STREAMING TABLE orderbook_bronze
+COMMENT 'One-minute order book snapshots: the top 5 levels parsed, the full book kept as raw VARIANT'
+AS SELECT raw:exchange::string AS exchange, raw:ticker::string AS ticker, raw:ts::timestamp AS ts,
+  transform(slice(raw:bids::array<array<double>>, 1, 5), l -> named_struct('price', l[0], 'size', l[1])) AS bids,
+  transform(slice(raw:asks::array<array<double>>, 1, 5), l -> named_struct('price', l[0], 'size', l[1])) AS asks,
+  raw, _metadata.file_path AS source_file, current_timestamp() AS ingested_at
+FROM STREAM read_files('${landing_path}', format => 'json', singleVariantColumn => 'raw');
+```
+
+- `read_files` in a streaming table is Auto Loader: each new file is picked up exactly once.
+- The pipeline runs in **continuous** mode on one small classic node (single node, `r5d.xlarge`, on demand, Core edition, no
+  Photon). Files reach bronze about 4 to 5 seconds after their minute, with no job, trigger or schedule in between.
+- Each row keeps the top 5 levels a side as arrays of `{price, size}` and the whole line as `raw` (VARIANT), so deeper levels
+  stay one expression away (`raw:bids[7][0]::double`) and the landing files can expire. `source_file` and `ingested_at` trace
+  every row back to its file.
+- One pipeline serves every exchange. A new exchange with the same format is a new folder under `landing/`; one with a
+  different format is one more SQL file with a flow into the same table.
+- In production, turn on file events on the S3 external location; the pipeline's event log advises it for continuous mode with
+  directory listing.
+
+### 1 · Features view
+
+`minute_features` turns each bronze row into the model's inputs and the value to predict:
+
+- `mid` is the average of the best bid and the best ask;
+- `spread_bps` and `order_imbalance` are the two inputs (explained in section 2);
+- `next_5min_return_bps` is how much the mid price moves over the next 5 minutes, kept only when the snapshot 5 minutes later
+  exists.
+
+The inputs use only the snapshot at `ts`; only the value to predict looks ahead, so nothing leaks from the future. A view costs
+nothing until it is read. If it gets heavy at real volumes, materialize it in a separate triggered pipeline, never in the
+continuous one.
+
+### 2 · Training: what the model does
+
+**In one sentence:** every minute, for each corridor, the model looks at two numbers in the order book and estimates how much
+the price will move over the next 5 minutes.
+
+| Name | Role | What it measures | Range here |
+|------|------|------------------|------------|
+| `spread_bps` | input | The gap between the cheapest offer to sell and the highest bid to buy, as a share of the price, in basis points (1 bp = 0.01%). A wider gap means trading is more expensive right now. | 0.5 to 3.5 bps |
+| `order_imbalance` | input | The balance between size waiting to buy and size waiting to sell in the top 5 levels: +1 means everything is on the buy side, -1 everything on the sell side, 0 balanced. | -1 to +1 |
+| `next_5min_return_bps` | output | How much the mid price actually moved over the next 5 minutes, in bps. This is what the model learns to predict. | A few bps either way |
+
+The model is a **linear regression**, the simplest model there is:
+
+```text
+predicted move (bps) = intercept + coef.spread_bps × spread_bps + coef.order_imbalance × order_imbalance
+```
+
+Training means finding the three numbers (two weights and a starting value) that make the predictions as close as possible to
+what really happened. Because there are only three numbers, anyone can read what the model has learned.
+
+**A worked example** with the first day's model (`coef.spread_bps` +0.40, `coef.order_imbalance` 0.78, `intercept` -0.70):
+for a minute with a 3 bps spread and an imbalance of +0.5, the prediction is -0.70 + 0.40 × 3 + 0.78 × 0.5 = **+0.89 bps**,
+so the model expects the price to be about 0.9 bp higher in 5 minutes.
+
+**How a day is trained.** The job takes one day of the view. The first 18 hours (00:00 to 17:59 UTC) are used to learn and
+the last 6 hours (18:00 to 23:59) are kept aside to test, because a daily job can't test on tomorrow. That is about 3,240
+training rows and 1,080 test rows (3 corridors × 60 minutes × 18 or 6 hours). The inputs are every column of the view except
+the keys and the output, so changing the view changes the model without touching `train.py`.
+
+**What each run records**, in the MLflow experiment (one run per training day) and on the Unity Catalog model version:
+
+| Name | Kind | What it means | How to read it |
+|------|------|---------------|----------------|
+| `coef.spread_bps` | metric | How many bps the predicted move changes for each extra bp of spread, with the imbalance unchanged | The sign is the direction (positive: a wider spread is followed by the price going up) and the size is the strength |
+| `coef.order_imbalance` | metric | How many bps the predicted move changes when the book goes from balanced (0) to all on the buy side (+1) | Positive: buying pressure is followed by the price going up |
+| `intercept` | metric | The starting value the two effects are added to, that is the prediction when both inputs are 0 | A spread of 0 never happens, so on its own it means little: it shifts the line so the average prediction matches the average move |
+| `holdout_mae` | metric | Mean absolute error on the 6 test hours: on average, how far the predictions were from what happened, in bps | The one value where lower is better |
+| `train_end_ts` | metric | The last training minute, as a Unix timestamp | Only there so charts can put training days on the X axis |
+| `train_date`, `rows_train`, `rows_holdout` | params | The day trained on, and how many rows went into learning and testing | Fewer rows than usual means data was missing that day |
+
+The model version also carries a `train_date` tag, and the deployment job adds an `evaluation` tag (and `Approval_Check` once
+approved).
+
+#### Higher or lower: which is better?
+
+Only `holdout_mae` has a better direction: **lower is better**, because the predictions were closer to what happened. The
+coefficients are not scores. A higher or lower coefficient is not better or worse; it describes how the market behaved that day.
+
+| Value | Better when | Warning sign |
+|-------|-------------|--------------|
+| `holdout_mae` | Lower | It rises from one version to the next. The deployment job holds a version that is more than 5% worse than `@champion`. |
+| `coef.spread_bps`, `coef.order_imbalance` | Stable from one day to the next. The size says how much that input matters; a value close to 0 means the input adds little. | The sign flips (the market now behaves the other way; the deployment job holds the version for a person) or the value swings a lot between days |
+| `intercept` | Neither: it only balances the formula | None on its own |
+| `train_end_ts`, row counts | Neither | Row counts lower than usual |
+
+On this synthetic data the true effects are known, so "right" for a coefficient means close to them:
+
+| Version | Day | `coef.spread_bps` (true value) | `coef.order_imbalance` (true value) | `holdout_mae` |
+|---------|-----|-------------------------------:|------------------------------------:|--------------:|
+| v1 | day 1 | +0.40 (+0.40) | 0.78 (0.80) | 1.29 |
+| v2 | day 2 | +0.39 (+0.40) | 0.78 (0.80) | 1.29 |
+| v3 | day 3 | -0.44 (-0.40) | 0.75 (0.80) | 1.28 |
+
+An error of about 1.3 bps is close to the best any model can do here: the feed adds random moves, and the price also reacts to
+the next few minutes' spread and imbalance, which no input at the time of the prediction can know.
+
+**Coefficients over time.** In the experiment's Chart view, plot `coef.spread_bps` with `train_end_ts` on the X axis: it stays
+near +0.4 for two days, then drops to near -0.4. For a table instead of a chart, `mlflow.search_runs` returns every metric of
+every run.
+
+### 3 · Deployment job (MLflow 3 deployment job, Public Preview)
+
+`setup.py` links the job to the Unity Catalog model, so every new version starts it with the model name and version. Versions
+are checked one at a time, in order.
+
+| Task | What it does |
+|------|--------------|
+| `Evaluation` | Scores the new version and `@champion` on the new version's 6 test hours, which neither model trained on. **The rule:** the new version's error is at most 5% worse than the champion's, and no coefficient changed sign. The result is written on the version as the `evaluation` tag, for example "MAE 1.283 vs champion v2 1.425; sign flip: spread_bps +0.39 → -0.44: rule failed, waiting for Approve". |
+| `Approval_Check` | Passes once the version has the tag `Approval_Check = Approved`. The **Approve** button on the model version page sets it and repairs the run. |
+| `Deployment` | Points the `@champion` alias at the version. Rolling back means pointing the alias at an older version. |
+
+Whether a person is in the loop is one setting, the job parameter `approval_mode`:
 
 | `approval_mode` | Rule passes | Rule fails |
-|---|---|---|
-| `auto` | Approved by Evaluation, promoted with no human | Waits at `Approval_Check` until someone clicks **Approve** |
+|-----------------|-------------|------------|
+| `auto` (default) | Approved by `Evaluation`, promoted with no person | Waits for **Approve** |
 | `human` | Waits for **Approve** | Waits for **Approve** |
 
-Change it in the job's parameters in the Jobs UI, or deploy with `--var approval_mode=human`. **During a live demo use the Jobs
-UI:** a deploy also sets the feed job back to paused (see the cost guard).
+Approvers need `APPLY TAG` on the model and `CAN MANAGE RUN` on the deployment job. There is no serving endpoint: scoring loads
+`@champion` directly.
 
-## Run it
+### 4 · Scoring and monitoring
+
+- `score_predictions` loads `@champion`, scores one day of `minute_features` (yesterday in UTC by default) and appends the rows
+  to `predictions` with `prediction_bps`, `actual_bps`, `model_version` and `scored_at`. Rerunning a day with the same version
+  replaces its rows; a day scored by two versions keeps both, for comparison.
+- Performance over time, on real predictions rather than only on the test hours, is one query:
+
+  ```sql
+  SELECT to_date(ts) AS day, model_version, count(*) AS predictions,
+         avg(abs(prediction_bps - actual_bps)) AS mae_bps
+  FROM predictions GROUP BY ALL ORDER BY day;
+  ```
+- The first run creates a **data profiling monitor** (formerly Lakehouse Monitoring) on the table, in inference-log mode for a
+  regression: prediction `prediction_bps`, label `actual_bps`, model id `model_version`, time `ts`, daily granularity. Each run
+  refreshes it. Its metrics land in `predictions_profile_metrics` and `predictions_drift_metrics`, with a dashboard, so drift in
+  the inputs and the predictions can be followed per model version.
+
+## Design choices
+
+- **Only bronze is continuous.** Minute freshness matters for landing the data; features, training, evaluation and scoring
+  read bronze when they need it. The always-on part is one small node, whatever the volume.
+- **Classic single node for the stream, serverless for the rest.** For one always-on stream a single classic node keeps the
+  cost down; the jobs start on serverless and stop when done.
+- **A view instead of silver and gold tables**, until it gets heavy enough to materialize in a triggered pipeline.
+- **Predictions in a table.** A serving endpoint is only needed if a per-request prediction is ever required.
+- **One rule a quant can read at a glance**, using only the logged coefficients, and **one setting** for a person in the loop.
+
+## Data model
+
+| Table | Columns |
+|-------|---------|
+| `orderbook_bronze` (streaming table) | `exchange`, `ticker`, `ts`, `bids` and `asks` (5 × `{price, size}`), `raw` (VARIANT, the whole line), `source_file`, `ingested_at` |
+| `minute_features` (view) | `exchange`, `ticker`, `ts`, `spread_bps`, `order_imbalance`, `next_5min_return_bps` (empty for the last 5 minutes) |
+| `predictions` (table) | `exchange`, `ticker`, `ts`, `spread_bps`, `order_imbalance`, `actual_bps`, `prediction_bps`, `model_version`, `scored_at` |
+
+## Where everything lives
+
+| Object | Name | Where |
+|--------|------|-------|
+| Schema, created by the bundle | `<schema>` (default `orderbook_ml_starter`) | `<catalog>` |
+| Volume (stands in for S3) | `landing` | `<catalog>.<schema>` |
+| Tables and view | `orderbook_bronze`, `minute_features`, `predictions`, the two monitor tables | `<catalog>.<schema>` |
+| Unity Catalog model | `next_5min_return_lr` | `<catalog>.<schema>` |
+| Pipeline and 4 jobs | `[orderbook-ml-starter] ...` | Workspace |
+| Bundle files, MLflow experiment, monitor dashboard | `orderbook-ml-starter/` (`files/`, `experiment`, `monitoring/`) | `/Workspace/Users/<you>/` |
+
+All data lives in one schema, so dropping the schema removes it all.
+
+## Deploy and run
+
+**Prerequisites:** a Unity Catalog workspace with serverless jobs and notebooks enabled; permission to create a schema in your
+catalog, classic clusters for pipelines, and jobs; MLflow 3 deployment jobs available (Public Preview); PyPI access from
+serverless (the notebooks install `mlflow>=3`); the Databricks CLI (tested with v1.21.0) for a laptop deploy.
+
+**Configure** the defaults in `databricks.yml` (not with `--var`: the scripts redeploy without it):
+
+```yaml
+variables:
+  catalog:   { default: <your catalog> }
+  schema:    { default: <a new schema> }
+  node_type: { default: r5d.xlarge }     # 4 vCPU / 32 GB; change it if not available
+targets:
+  dev:
+    workspace:
+      host: <your workspace URL>        # no profile here: pass --profile on the command line
+```
+
+`databricks.yml` has no profile on purpose, because the workspace authenticates the CLI from its environment and doesn't
+support profiles. Locally, pass `--profile` to every command and export `PROFILE=<profile>` for the scripts.
+
+**Deploy** from a laptop with `databricks bundle deploy --profile <profile>`, or from the workspace: clone this repository as a
+Git folder, open it, and in the bundle editor's **Deployments** panel pick `dev` and click **Deploy**. Both are the same
+deployment (same bundle name, target and user), so they update the same jobs and pipeline.
+
+**Run:**
 
 ```bash
-databricks bundle deploy --profile <profile>   # creates everything; the first deploy starts the pipeline
+databricks bundle deploy --profile <profile>   # the first deploy creates everything and starts the pipeline
 scripts/live.sh start                          # unpause the feed (and start the pipeline if it isn't running)
-# wait until bronze has the backfill, then train one day at a time, oldest first:
+# when bronze has the three days, train them one at a time, oldest first:
 databricks bundle run train_model --params train_date=<YYYY-MM-DD> --profile <profile>
-# once the deployment job has promoted v2, score day 3 with @champion:
+# once the deployment job has promoted v2, score day 3:
 databricks bundle run score_predictions --params score_date=<YYYY-MM-DD> --profile <profile>
 scripts/live.sh stop                           # pause the feed and stop the pipeline
-scripts/reset_demo.sh                          # after a rehearsal: back to v2 champion, v3 waiting, day 3 scored by v2
 ```
 
-Train and score only complete days (UTC): training needs more than 100 rows in both the first 18 hours and the last 6.
+Train and score only complete days (UTC). Without parameters, both jobs use yesterday.
 
-To use it in another workspace, set the `dev` target's `host`, and the `catalog` and `schema` variable defaults in
-`databricks.yml` (not with `--var`: the scripts redeploy without it). `databricks.yml` holds no profile on purpose (see "Working from
-the workspace"), so pass `--profile` to every CLI command and export `PROFILE=<profile>` for the scripts. Change
-`node_type` if `r5d.xlarge` isn't available. [`AGENT.md`](AGENT.md) has the full checklist, including what to change for a second copy
-in the same workspace.
+**Cost guard.** The feed and the pipeline run until they are stopped, and the pipeline is classic on-demand compute. Creating
+the pipeline or changing its settings starts it; a redeploy that only changes SQL doesn't. **A deploy sets the feed job back to
+paused, but a feed run already in progress keeps writing**, and `live.sh status` then reports `PAUSED`. Run
+`scripts/live.sh stop` after every session (it also cancels the feed run) and check with `scripts/live.sh status`.
 
-**Cost guard.** The feed and the pipeline run until they are stopped, and the pipeline is classic on-demand compute.
-**Creating the pipeline or changing its settings starts it** (a redeploy that only changes SQL doesn't). Run `scripts/live.sh stop`
-after every session and check with `scripts/live.sh status`. **Any `bundle deploy` sets the feed job back to `PAUSED`, but a feed run
-already in progress keeps writing**, and `live.sh status` then reports `PAUSED`. `live.sh stop` cancels that run too.
+## Operate
 
-## Changing the file format or the bronze columns
+- **Approve a waiting version:** open the version in Catalog Explorer and click **Approve**, or set the `Approval_Check` tag and
+  repair the run with its `job_parameters` (and `latest_repair_id` if it was repaired before). A repair without parameters
+  fails on purpose instead of promoting the wrong version.
+- **Switch approval mode:** change `approval_mode` in the job's parameters in the Jobs UI, or deploy with
+  `--var approval_mode=human`. While the feed is live, use the Jobs UI (a deploy re-pauses the feed job).
+- **Reset to a known state:** `scripts/reset_demo.sh` (about 8 minutes) redeploys, deletes the model and the experiment's runs,
+  empties `predictions`, trains the first three days again and scores the third. You end with `@champion` = v2 and v3 waiting
+  for approval. Bronze and the landing files are kept. If it stops on an error, wait until `model_deployment` has no active run
+  and run it again.
+- **Change the file format or the bronze columns:** the feed fails on files in another format, and new columns need one full
+  refresh:
 
-The feed carries on from the last file it finds, and it fails on a file in another format. Bronze is a streaming table, so new
-columns need one full refresh. The 2026-11-22 upgrade from top-of-book files to the 20-level book took these steps:
+  ```bash
+  scripts/live.sh stop
+  databricks fs rm -r dbfs:/Volumes/<catalog>/<schema>/landing/exchange_1 --profile <profile>
+  databricks bundle deploy --profile <profile>
+  databricks pipelines start-update <pipeline id> --full-refresh --profile <profile>
+  scripts/live.sh start
+  scripts/reset_demo.sh   # once bronze has caught up
+  ```
+- **Work from the workspace:** after a push, pull in the Git folder before deploying from it. The scripts also run in the
+  web terminal (classic compute on Databricks Runtime 15.0 or above, enabled by an admin): `cd` into the Git folder and run
+  `bash scripts/live.sh status`.
+- **Use your own variables:** change the view (and, on synthetic data, the feed's planted effects). Training, deployment and
+  scoring pick up the view's columns without changes.
 
-```bash
-scripts/live.sh stop
-databricks fs rm -r dbfs:/Volumes/<catalog>/<schema>/landing/exchange_1 --profile <profile>   # old-format files
-databricks bundle deploy --profile <profile>
-databricks pipelines start-update <pipeline id> --full-refresh --profile <profile>
-scripts/live.sh start          # the feed writes 3 days again from midnight UTC, then goes live
-scripts/reset_demo.sh          # once bronze has caught up: new model versions on the new data
+## Before production
+
+What this project leaves out on purpose:
+
+- File events on the S3 external location.
+- Fewer, larger files from the producers: one per exchange per minute, or batched by Amazon Data Firehose, which can also write
+  Parquet.
+- Running the jobs as a service principal, and deciding who may approve versions.
+- Measuring one real day (bytes, files, run time) before sizing cost.
+- A separate triggered pipeline for the features if the view gets heavy, and serving `@champion` behind a UI if a per-request
+  prediction is ever needed.
+
+<details>
+<summary>What we observed on synthetic data (2026-11-22 and 23)</summary>
+
+| Check | Result |
+|-------|--------|
+| Latency, file to bronze | 4.3 s on average, 4.6 s at most, over 27 live minutes |
+| Completeness | 4,320 rows a day (3 corridors × 1,440 minutes), no gaps or duplicates; after a pause the feed filled the missed minutes |
+| Pipeline cold start | 7 to 8 minutes for the classic cluster, then about 1 minute to load a backlog of several hours |
+| Coefficients | Recovered the planted values (table in section 2) |
+| Deployment job | v1 and v2 promoted automatically; v3 held on the sign flip; with `approval_mode = human`, a version that passed still waited |
+| Scoring | 4,320 predictions per day; the error of v2 rose from 1.28 to 1.44 bps on the day the market changed |
+| Deploy from a fresh clone | Reused the existing deployment: 0 created, 0 changed |
+
+</details>
+
+## Repository layout
+
+```text
+orderbook-ml-starter/
+├── databricks.yml              # bundle: variables (catalog, schema, node_type, approval_mode) and the dev target
+├── AGENT.md                    # instructions for coding tools
+├── docs/architecture.mmd|png   # the diagram above
+├── resources/                  # one YAML per component, plus schema.yml (schema, volume, experiment)
+├── src/
+│   ├── feed/exchange_feed.py                         # 0
+│   ├── orderbook_bronze/transformations/orderbook_bronze.sql   # 1
+│   ├── training/minute_features.sql, setup.py, train.py        # 1 and 2
+│   ├── deployment/evaluation.py, approval_check.py, deployment.py   # 3
+│   └── scoring/score.py                              # 4
+└── scripts/live.sh, reset_demo.sh   # start, stop and check the live pieces; reset to a known state
 ```
 
-## Rehearse, then reset
+## Documentation
 
-The demo's opening state is `@champion` = v2, v3 waiting at `Approval_Check`, and day 3 scored by v2. Approving v3 uses it up.
-`scripts/reset_demo.sh` redeploys (so `approval_mode` is back to the bundle default), deletes the model (all versions), the
-experiment's runs and the predictions rows, trains the first three days again and scores the third (about 8 minutes). Bronze and
-the landing files are kept. The script stops on the first error, including a network blip while it waits on a run; then wait until
-`model_deployment` has no active run and run it again.
-
-## Working from the workspace (Git folder and bundle editor)
-
-The project is a Git repository, `https://github.com/francisco-martin-databricks/orderbook_ml_starter`. In the workspace it is a
-**Git folder**, `/Workspace/Users/<you>/orderbook_ml_starter`, which opens in the workspace bundle editor: open the folder, then in
-the **Deployments** panel pick the `dev` target and click **Deploy**. The workspace needs workspace files and serverless compute
-enabled, and a Git credential (Settings → Linked accounts) that can read the repository.
-
-To create the Git folder in another workspace: **Workspace → Create → Git folder** with the repository URL, or
-
-```bash
-databricks repos create https://github.com/francisco-martin-databricks/orderbook_ml_starter.git gitHub \
-  --path /Workspace/Users/<you>/orderbook_ml_starter --profile <profile>   # add --git-credential-id <id> if you have several
-```
-
-- **One deployment.** A deploy from the bundle editor runs as you with the same bundle name, target and user as a deploy from a
-  laptop, so it updates the same jobs and pipeline and shares one state. A deploy from a fresh clone of the repository reused the
-  existing deployment ("0 created, 0 changed, 8 unchanged").
-- **No profile in `databricks.yml`.** The workspace authenticates the CLI from its environment and doesn't support profiles, so
-  the file has only the host. Locally, pass `--profile`; the scripts set a profile only when `DATABRICKS_HOST` is unset.
-- **Scripts in the workspace:** from the web terminal (classic compute on Databricks Runtime 15.0 or above, enabled by an admin),
-  `cd` into the Git folder and run `bash scripts/live.sh status`. Workspace files don't keep the executable bit.
-- **Don't deploy while the feed is live**: a deploy sets the feed job back to paused while its run keeps writing (see the cost guard).
-- **After a push**, pull in the Git folder (the **Pull** button, or `databricks repos update <repo id> --branch main`) before
-  deploying from the editor.
-
-## What got built (fevm-francisco-martin-classic)
-
-| Asset | ID / name |
-|-------|-----------|
-| Pipeline `[orderbook-ml-starter] orderbook_bronze` | `14430eac-ddc2-4fb6-9e30-00652f477f10` (table `orderbook_bronze`) |
-| Job `[orderbook-ml-starter] exchange_feed` | `499236559364000` (continuous trigger, paused) |
-| Job `[orderbook-ml-starter] train_model` | `595803664420401` (daily 00:30 UTC, paused) |
-| Job `[orderbook-ml-starter] model_deployment` | `1031832955750898`, linked to the model |
-| Job `[orderbook-ml-starter] score_predictions` | `573979575598905` (daily 01:00 UTC, paused) |
-| Schema / volume | `francisco_martin_catalog.orderbook_ml_starter` / `landing` |
-| Tables | `orderbook_bronze`, view `minute_features`, `predictions` (+ monitor tables `predictions_profile_metrics`, `predictions_drift_metrics`) |
-| UC model | `next_5min_return_lr` |
-| Experiment | `/Users/<you>/orderbook-ml-starter/experiment` (`1592869286900929`) |
-| Monitor dashboard | `01f1e6895d671e01af29134c663433da` |
-| Git folder | `/Workspace/Users/<you>/orderbook_ml_starter` (repo id `510576321219604`) |
-
-### Verification log, 2026-11-22 (current format)
-- **Upgrade:** the steps in "Changing the file format" above. Without deleting the old files the feed fails with
-  `AttributeError: 'Pandas' object has no attribute 'bids'`.
-- **Pipeline:** settings unchanged and as specified. The cluster started in 7 minutes (full refresh) and 8 minutes (cold
-  `live.sh start`); the backfill of 15,714 rows reached bronze about a minute after that.
-- **Bronze:** 4,320 rows a day, no duplicates, no gaps, 5 parsed levels a side and 20 in `raw`. Live latency 4.3 s on average,
-  4.6 s at most, over 27 minutes. After `live.sh stop`, a 4-minute pause and `live.sh start`, the feed filled the gap.
-- **Coefficients** (planted +0.40 / 0.80, then −0.40 / 0.80 from 11-21): 11-19 +0.396 / 0.782, 11-20 +0.391 / 0.783,
-  11-21 −0.438 / 0.754. Holdout MAE 1.28 to 1.29 bps.
-- **Deployment job:** v1 approved (no champion), v2 approved automatically ("MAE 1.293 vs champion v1 1.288"), v3 held
-  ("MAE 1.283 vs champion v2 1.425; sign flip: spread_bps +0.39 → -0.44"). With `approval_mode = human`, v4 passed the rule and
-  waited; back on `auto`, v5 was promoted with no human.
-- **Approve from the CLI:** set the tag and repair the run with its `job_parameters` and, if it was repaired before, the
-  `latest_repair_id`. A repair without parameters now fails (`For input string: ""`) instead of promoting a wrong version.
-- **Scoring:** 4,320 predictions per day, tagged with the model version; the first run created the monitor, and a second run
-  while it was refreshing queued another refresh. v2's MAE was 1.28 on 11-20 and 1.44 on 11-21, after the market change.
-- **Reset:** `reset_demo.sh` restored the opening state in about 8 minutes (on the second attempt; the first stopped on a
-  network error).
-- **Code size:** about 195 lines without markdown, comments or `%pip` (feed 48, scoring 35, evaluation 31, train 29, setup 16,
-  view 13, approval check 9, pipeline SQL 7, deployment 7).
-
-### Verification log, 2026-11-10 and 11 (previous format: top of book, flat bronze columns)
-- **Pipeline settings (live JSON):** `serverless: false`, `continuous: true`, `edition: CORE`, `photon: false`, no `development`,
-  `num_workers: 0`, `r5d.xlarge`, `ON_DEMAND`, `root_path` and the `transformations/**` glob. Created on deploy and started by it;
-  the cluster took about 8.5 minutes to start. A redeploy with unchanged pipeline settings left it idle.
-- **Feed:** a continuous job on serverless ran one Python loop for 5 hours without a restart. Backfill from 2026-11-07 00:00,
-  then live. Bronze: 1,440 minutes a day × 3 corridors, no gaps and no duplicates over 4 full days.
-- **Live latency:** over 61 live minutes, files were in bronze 4.3 s after their minute on average, 4.6 s at most. The event log
-  shows Databricks' own advisory to use file events instead of directory listing in continuous mode.
-- **Coefficients** (planted +0.40 / 0.80, then −0.40 / 0.80 from 11-09): 11-07 +0.42 / 0.86, 11-08 +0.40 / 0.82,
-  11-09 −0.36 / 0.80. Holdout MAE 1.31 bps. The metrics are on the run and on the logged model behind each UC version.
-- **Deployment job:** v1 approved (no champion), v2 approved automatically ("MAE 1.305 vs champion v1 1.306"), v3 held
-  ("MAE 1.315 vs champion v2 1.455; sign flip: spread_bps +0.40 → -0.36: rule failed, waiting for Approve").
-  Runs started by a new version receive the job's default `approval_mode` (`auto`).
-- **Approve:** setting `Approval_Check = Approved` and repairing the run moved `@champion` to v3. **Repairing from the CLI or
-  API needs the run's `job_parameters` passed explicitly**: a bare `repair-run` reran the tasks with the job defaults
-  (`model_version` was then `"1"`, and `@champion` moved to v1). The default is now empty, so a repair without parameters
-  fails instead. Use the **Approve** button in the UI, and check during the rehearsal that it promotes the right version.
-- **The approval switch:** with `approval_mode = human` (deployed with `--var approval_mode=human`), v4 trained on 11-10 passed
-  the rule ("MAE 1.163 vs champion v3 1.163: rule passed, waiting for Approve") and its run stopped at `Approval_Check`;
-  `@champion` stayed on v3. `scripts/reset_demo.sh` then restored `auto` and the opening state.
-- **Quirk:** a task that raises on purpose (`Approval_Check` waiting) ends as `INTERNAL_ERROR` and is retried once. Harmless.
-- **Code size** (code lines without markdown or `%pip`): feed 42 (budget 35, mostly widgets and imports), pipeline SQL 5 (8),
-  view 11 (12), setup 15 (20), train 28 (40), evaluation 30 (30), approval check 8 (10), deployment 6 (6). Total 145.
-- The bundle shows a "Single node cluster is not correctly configured" warning on every command. It is generic cluster
-  validation: the pipeline sets the single-node profile itself, as in the 2026-11-06 build.
+- Ingestion and pipelines: [Auto Loader](https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/) ·
+  [`read_files`](https://docs.databricks.com/aws/en/sql/language-manual/functions/read_files) ·
+  [Auto Loader file detection modes (file events)](https://docs.databricks.com/aws/en/ingestion/cloud-object-storage/auto-loader/file-detection-modes) ·
+  [Ingest semi-structured data as VARIANT](https://docs.databricks.com/aws/en/ingestion/variant) ·
+  [Triggered vs. continuous pipeline mode](https://docs.databricks.com/aws/en/ldp/pipeline-mode) ·
+  [Configure classic compute for pipelines](https://docs.databricks.com/aws/en/ldp/configure-compute) ·
+  [Serverless pipelines](https://docs.databricks.com/aws/en/ldp/serverless) ·
+  [Flows: several sources into one table](https://docs.databricks.com/aws/en/ldp/flows) ·
+  [Backfilling historical data](https://docs.databricks.com/aws/en/ldp/flows-backfill) ·
+  [Continuous jobs](https://docs.databricks.com/aws/en/jobs/continuous)
+- Models: [MLflow experiment tracking](https://docs.databricks.com/aws/en/mlflow/tracking) ·
+  [MLflow Logged Models](https://docs.databricks.com/aws/en/mlflow/logged-model) ·
+  [Models in Unity Catalog (versions, aliases)](https://docs.databricks.com/aws/en/machine-learning/manage-model-lifecycle/) ·
+  [MLflow 3 deployment jobs](https://docs.databricks.com/aws/en/mlflow/deployment-job) ·
+  [Data quality monitoring (data profiling)](https://docs.databricks.com/aws/en/data-quality-monitoring/)
+- Deployment: [Declarative Automation Bundles](https://docs.databricks.com/aws/en/dev-tools/bundles/) ·
+  [Bundles in the workspace](https://docs.databricks.com/aws/en/dev-tools/bundles/workspace) ·
+  [Web terminal](https://docs.databricks.com/aws/en/compute/web-terminal)
