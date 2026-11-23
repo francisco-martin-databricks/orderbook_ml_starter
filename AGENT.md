@@ -109,22 +109,22 @@ No credentials belong in this folder. Authentication comes from the CLI profile 
 
 Only train **complete** days: training needs more than 100 rows in both the first 18 hours and the last 6 hours (UTC) of the day.
 
-### Deploying from the workspace instead of a laptop
+### Deploying from the workspace bundle editor (Git folder)
 
-If the user wants the files visible and deployable in the workspace, copy the source to a regular folder (not the bundle's `root_path`) and deploy from the web terminal:
+The workspace bundle editor (Deployments panel, **Deploy** button) only works on a bundle inside a **Git folder**, which needs a remote repository. If the user wants it:
 
-```bash
-# from the project folder on the laptop
-databricks sync --include "src/**" --include "resources/**" --include "scripts/**" --include "*.md" --include "databricks.yml" \
-  --exclude ".databricks/**" . /Workspace/Users/<user>/orderbook-ml-starter-source --profile <profile>
-# then, in the workspace web terminal (admin-enabled, classic compute on DBR 15.0+)
-cd /Workspace/Users/<user>/orderbook-ml-starter-source && databricks bundle deploy && bash scripts/live.sh status
-```
+1. Ask for the repository URL and confirm a workspace Git credential can read it: `databricks git-credentials list --profile <p>`. If none can, the user adds one under Settings → Linked accounts.
+2. Check the path is free (`databricks workspace get-status <path>` returns "doesn't exist"), then create the Git folder:
 
-- Check the destination doesn't exist first (`databricks workspace get-status <path>` returns "doesn't exist"); never sync over someone else's folder.
-- A deploy from the workspace uses the same bundle identity (name, target, user) and therefore the same resources and state as a laptop deploy.
-- The workspace bundle editor's **Deploy** button needs a Git folder; a regular folder deploys through the web terminal.
-- The sync is one way; re-syncing overwrites edits made in the workspace.
+   ```bash
+   databricks repos create <repo-url> gitHub --path /Workspace/Users/<user>/<folder> --profile <p> [--git-credential-id <id>]
+   ```
+3. The user opens the folder, picks the target in the **Deployments** panel and clicks **Deploy**. An automated browser usually can't sign in to the workspace (device and SSO policies), so leave the click to the user.
+
+- A deploy from the editor uses the same bundle identity (name, target, user) as a CLI deploy, so it updates the same resources and state.
+- After every push, pull in the Git folder (`databricks repos update <repo id> --branch main --profile <p>`) before deploying from it.
+- Without a Git folder, the same bundle deploys from any workspace folder through the web terminal: `cd <folder> && databricks bundle deploy`.
+- Before pushing to a shared or customer-visible repository, check that no customer-specific notes are tracked (keep them in `.gitignore`).
 
 ### Demo operations
 

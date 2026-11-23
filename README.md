@@ -93,35 +93,30 @@ experiment's runs and the predictions rows, trains the first three days again an
 the landing files are kept. The script stops on the first error, including a network blip while it waits on a run; then wait until
 `model_deployment` has no active run and run it again.
 
-## Working from the workspace
+## Working from the workspace (Git folder and bundle editor)
 
-The whole project (this README, `AGENT.md`, the spec, `databricks.yml`, `resources/`, `src/` and `scripts/`) is also in a regular
-workspace folder, `/Workspace/Users/<you>/orderbook-ml-starter-source`, so every file can be opened and shown in the UI. It is a
-copy, separate from the bundle's deployment folder `/Workspace/Users/<you>/orderbook-ml-starter` (`files/`, `state/`).
+The project is a Git repository, `https://github.com/francisco-martin-databricks/orderbook_ml_starter`. In the workspace it is a
+**Git folder**, `/Workspace/Users/<you>/orderbook_ml_starter`, which opens in the workspace bundle editor: open the folder, then in
+the **Deployments** panel pick the `dev` target and click **Deploy**. The workspace needs workspace files and serverless compute
+enabled, and a Git credential (Settings → Linked accounts) that can read the repository.
 
-**Deploy from there with the web terminal** (an admin must enable it; it runs on classic compute with Databricks Runtime 15.0 or
-above). In the terminal the CLI authenticates as you from the environment, and profiles aren't supported, which is why
-`databricks.yml` has no profile and the scripts only set one when `DATABRICKS_HOST` is unset:
-
-```bash
-cd /Workspace/Users/<you>/orderbook-ml-starter-source
-databricks bundle deploy
-bash scripts/live.sh status        # run the scripts with bash: workspace files don't keep the executable bit
-```
-
-A deploy from there uses the same bundle name, target and user as a deploy from a laptop, so it updates the same jobs and
-pipeline (one deployment, one state). The **Deploy** button of the workspace bundle editor needs the bundle in a Git folder,
-not a regular folder. The deploy from the web terminal has not been tested yet; the 2026-11-22 tests ran from a laptop.
-
-**Keeping the copy current.** The copy is refreshed one way, from the laptop, and a refresh overwrites edits made in the
-workspace. After a local change, from this folder:
+To create the Git folder in another workspace: **Workspace → Create → Git folder** with the repository URL, or
 
 ```bash
-databricks sync --include "src/**" --include "resources/**" --include "scripts/**" --include "*.md" --include "databricks.yml" \
-  --exclude ".databricks/**" . /Workspace/Users/<you>/orderbook-ml-starter-source --profile <profile>
+databricks repos create https://github.com/francisco-martin-databricks/orderbook_ml_starter.git gitHub \
+  --path /Workspace/Users/<you>/orderbook_ml_starter --profile <profile>   # add --git-credential-id <id> if you have several
 ```
 
-(The `--include` flags are needed because the repository this folder sits in ignores it in `.gitignore`.)
+- **One deployment.** A deploy from the bundle editor runs as you with the same bundle name, target and user as a deploy from a
+  laptop, so it updates the same jobs and pipeline and shares one state. A deploy from a fresh clone of the repository reused the
+  existing deployment ("0 created, 0 changed, 8 unchanged").
+- **No profile in `databricks.yml`.** The workspace authenticates the CLI from its environment and doesn't support profiles, so
+  the file has only the host. Locally, pass `--profile`; the scripts set a profile only when `DATABRICKS_HOST` is unset.
+- **Scripts in the workspace:** from the web terminal (classic compute on Databricks Runtime 15.0 or above, enabled by an admin),
+  `cd` into the Git folder and run `bash scripts/live.sh status`. Workspace files don't keep the executable bit.
+- **Don't deploy while the feed is live**: a deploy sets the feed job back to paused while its run keeps writing (see the cost guard).
+- **After a push**, pull in the Git folder (the **Pull** button, or `databricks repos update <repo id> --branch main`) before
+  deploying from the editor.
 
 ## What got built (fevm-francisco-martin-classic)
 
@@ -137,7 +132,7 @@ databricks sync --include "src/**" --include "resources/**" --include "scripts/*
 | UC model | `next_5min_return_lr` |
 | Experiment | `/Users/<you>/orderbook-ml-starter/experiment` (`1592869286900929`) |
 | Monitor dashboard | `01f1e6895d671e01af29134c663433da` |
-| Source copy (regular folder) | `/Workspace/Users/<you>/orderbook-ml-starter-source` |
+| Git folder | `/Workspace/Users/<you>/orderbook_ml_starter` (repo id `510576321219604`) |
 
 ### Verification log, 2026-11-22 (current format)
 - **Upgrade:** the steps in "Changing the file format" above. Without deleting the old files the feed fails with

@@ -3,7 +3,7 @@
 bundle:
   name: orderbook-ml-starter
 
-# This folder sits inside a repo whose .gitignore excludes it, so list what the bundle must sync.
+# Always sync these, whichever .gitignore applies (the design notes stay local and are not listed).
 sync:
   include:
     - src/**
